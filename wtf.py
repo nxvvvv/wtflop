@@ -19,6 +19,8 @@ from rich import print as rprint
 import questionary
 from questionary import Style
 import subprocess
+import threading
+import msvcrt  # For Windows keyboard input
 
 # Import benchmark modules
 from utils.arch import get_accelerator_arch
@@ -60,6 +62,9 @@ custom_style = Style([
 ])
 
 console = Console()
+
+# Variable to track termination state
+TERMINATE_REQUESTED = False
 
 def create_parser():
     """Create the argument parser with all options"""
@@ -380,6 +385,21 @@ def build_command(benchmark, benchmark_options, general_options):
     
     return cmd
 
+def keyboard_monitor():
+    """Monitor keyboard input for stop command ('s' key)"""
+    global TERMINATE_REQUESTED
+    
+    print("\n[bold yellow]Press 's' to stop the benchmark gracefully after current trial[/bold yellow]")
+    
+    while True:
+        if msvcrt.kbhit():
+            key = msvcrt.getch().decode('utf-8').lower()
+            if key == 's':
+                print("\n[bold yellow]Stop requested. Completing current trial before stopping...[/bold yellow]")
+                TERMINATE_REQUESTED = True
+                break
+        time.sleep(0.1)
+
 def run_interactive():
     """Run the benchmarking tool interactively"""
     display_welcome()
@@ -415,6 +435,8 @@ def run_interactive():
         subprocess.run(cmd)
 
 def main():
+    global TERMINATE_REQUESTED
+    
     # Check if any arguments were provided
     if len(sys.argv) == 1:
         # No arguments - run interactive mode
@@ -494,8 +516,14 @@ def main():
     # Set up signal handler for clean exit
     start_time = time.time()
     
-    # Modify signal handler to include monitoring
+    # Start the keyboard monitor thread (but only for non-interactive mode)
+    monitor_thread = threading.Thread(target=keyboard_monitor, daemon=True)
+    monitor_thread.start()
+    
+    # Modify signal handler to include the termination flag
     def signal_handler(signum, frame):
+        global TERMINATE_REQUESTED
+        TERMINATE_REQUESTED = True
         if monitor:
             print("Stopping GPU monitoring...")
             monitor.stop_monitoring()
@@ -506,7 +534,8 @@ def main():
     # Run the selected benchmark
     if args.benchmark in AVAILABLE_BENCHMARKS:
         try:
-            result = AVAILABLE_BENCHMARKS[args.benchmark](args)
+            # Pass the termination flag to the benchmark functions
+            result = AVAILABLE_BENCHMARKS[args.benchmark](args, termination_flag=TERMINATE_REQUESTED)
             
             # If result is a tuple of (tflops, config) store it in a summary
             if isinstance(result, tuple) and len(result) == 2:
