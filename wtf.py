@@ -573,8 +573,9 @@ def main():
     # Run the selected benchmark
     if args.benchmark in AVAILABLE_BENCHMARKS:
         try:
-            # Run benchmark and pass termination flag
-            result = AVAILABLE_BENCHMARKS[args.benchmark](args, termination_flag=TERMINATE_REQUESTED)
+            # Run benchmark WITHOUT passing termination_flag directly
+            # Instead, use the global variable that the benchmark functions can check
+            result = AVAILABLE_BENCHMARKS[args.benchmark](args)
             
             # Process benchmark results if they were returned
             if isinstance(result, tuple) and len(result) == 2:

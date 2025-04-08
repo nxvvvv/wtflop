@@ -11,6 +11,7 @@ import warnings
 from pathlib import Path
 
 from utils.arch import get_accelerator_arch
+from utils.utilities import should_terminate
 
 warnings.filterwarnings("ignore", message="set_metric_names is experimental*")
 
@@ -170,11 +171,17 @@ def run_benchmark(args):
         study.enqueue_trial({"M": m, "N": n, "K": k})
 
     # Run optimization
-    study.optimize(
-        lambda trial: objective(trial, args, dtype, device),
-        n_trials=args.n_trials,
-        callbacks=[print_progress]
-    )
+    for iteration in range(args.num_iterations):
+        # Check if we should terminate after each iteration
+        if should_terminate():
+            print("Gracefully stopping benchmark as requested...")
+            break
+
+        study.optimize(
+            lambda trial: objective(trial, args, dtype, device),
+            n_trials=args.n_trials,
+            callbacks=[print_progress]
+        )
     
     # Finish benchmark and return results
     best_tflops, best_config = finish(study, start_time)

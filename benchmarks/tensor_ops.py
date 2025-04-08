@@ -12,6 +12,7 @@ import pandas as pd
 import gc
 
 from utils.arch import get_accelerator_arch
+from utils.utilities import should_terminate
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -1065,6 +1066,11 @@ def run_benchmark(args):
                                     }
                         except Exception as e:
                             print(f"\nError with {config}: {e}")
+                        
+                        # Check if we should terminate after each iteration
+                        if should_terminate():
+                            print("Gracefully stopping benchmark as requested...")
+                            break
         
         # Print best results
         print("\n\nBenchmark Complete!")

@@ -58,3 +58,9 @@ def handle_sigkill(start_time):
     time_str = str(datetime.timedelta(seconds=time_delta)).split(".")[0]
     print(f"\nBenchmark interrupted after {time_str}")
     sys.exit(1)
+
+def should_terminate():
+    """Check if termination has been requested"""
+    # Import the global flag from the main script
+    from wtf import TERMINATE_REQUESTED
+    return TERMINATE_REQUESTED
