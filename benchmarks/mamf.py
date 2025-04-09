@@ -9,6 +9,7 @@ import optuna
 from optuna.storages import RDBStorage
 import warnings
 from pathlib import Path
+from rich import print as rprint
 
 from utils.arch import get_accelerator_arch
 from utils.utilities import should_terminate
@@ -170,18 +171,25 @@ def run_benchmark(args):
     for m, n, k in known_best_shapes:
         study.enqueue_trial({"M": m, "N": n, "K": k})
 
-    # Run optimization
-    for iteration in range(args.num_iterations):
-        # Check if we should terminate after each iteration
+    # Instead of running multiple iterations with optimize inside,
+    # we'll run one trial at a time and check for termination after each
+    n_trials_completed = 0
+    max_trials = args.num_iterations * args.n_trials
+    
+    while n_trials_completed < max_trials:
+        # Check if termination was requested before starting a new trial
         if should_terminate():
-            print("Gracefully stopping benchmark as requested...")
+            rprint("[bold yellow]Benchmark stopped gracefully as requested[/bold yellow]")
             break
-
+            
+        # Run just one trial
         study.optimize(
             lambda trial: objective(trial, args, dtype, device),
-            n_trials=args.n_trials,
+            n_trials=1,
             callbacks=[print_progress]
         )
+        
+        n_trials_completed += 1
     
     # Finish benchmark and return results
     best_tflops, best_config = finish(study, start_time)

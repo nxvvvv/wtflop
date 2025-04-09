@@ -1069,8 +1069,17 @@ def run_benchmark(args):
                         
                         # Check if we should terminate after each iteration
                         if should_terminate():
-                            print("Gracefully stopping benchmark as requested...")
-                            break
+                            print("\n[bold yellow]Benchmark stopped gracefully as requested[/bold yellow]")
+                            break  # Break from N loop
+                    
+                    if should_terminate():
+                        break  # Break from B loop
+                
+                if should_terminate():
+                    break  # Break from dtype_str loop
+            
+            if should_terminate():
+                break  # Break from op_type loop
         
         # Print best results
         print("\n\nBenchmark Complete!")

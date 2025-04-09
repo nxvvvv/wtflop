@@ -7,6 +7,8 @@ import time
 import tty
 import torch
 
+TERMINATE_FLAG = False
+
 def print_benchmark_header(dtype, device, notes="None", arch=None):
     """Print a formatted header for the benchmark"""
     if arch is None:
@@ -61,6 +63,11 @@ def handle_sigkill(start_time):
 
 def should_terminate():
     """Check if termination has been requested"""
-    # Import the global flag from the main script
-    from wtf import TERMINATE_REQUESTED
-    return TERMINATE_REQUESTED
+    global TERMINATE_FLAG
+    return TERMINATE_FLAG
+
+def set_terminate():
+    """Set the termination flag"""
+    global TERMINATE_FLAG
+    TERMINATE_FLAG = True
+    print("\n[bold yellow]Termination flag set - will stop after current trial[/bold yellow]")

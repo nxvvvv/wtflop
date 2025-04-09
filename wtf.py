@@ -33,7 +33,7 @@ if IS_WINDOWS:
 # Import utility modules
 from utils.arch import get_accelerator_arch  # GPU architecture detection
 from utils.tee import Tee  # Output redirection to both console and file
-from utils.utilities import print_benchmark_header, handle_sigkill
+from utils.utilities import print_benchmark_header, handle_sigkill, set_terminate
 from utils.gpu_monitor import GPUMonitor  # GPU resource usage monitoring
 
 
@@ -414,9 +414,7 @@ def build_command(benchmark, benchmark_options, general_options):
 
 def keyboard_monitor():
     """Monitor keyboard input for stop command ('s' key) - works on both Windows and Linux"""
-    global TERMINATE_REQUESTED
-    
-    rprint("[bold yellow]Press 's' to stop the benchmark gracefully after current trial[/bold yellow]")
+    rprint("\n[bold yellow]Press 's' to stop the benchmark gracefully after current trial[/bold yellow]")
     
     if IS_WINDOWS:
         # Windows-specific keyboard input handling
@@ -425,20 +423,27 @@ def keyboard_monitor():
                 key = msvcrt.getch().decode('utf-8', errors='ignore').lower()
                 if key == 's':
                     rprint("\n[bold yellow]Stop requested. Completing current trial before stopping...[/bold yellow]")
-                    TERMINATE_REQUESTED = True
+                    set_terminate()  # Call the function to set termination flag
                     break
             time.sleep(0.1)  # Prevent CPU hogging
     else:
-        # Linux/Mac keyboard input handling
-        while True:
-            # Use select to check if input is available
-            if select.select([sys.stdin], [], [], 0.1)[0]:
-                key = sys.stdin.read(1).lower()
-                if key == 's':
-                    rprint("\n[bold yellow]Stop requested. Completing current trial before stopping...[/bold yellow]")
-                    TERMINATE_REQUESTED = True
-                    break
-            time.sleep(0.1)  # Prevent CPU hogging
+        # Linux/Mac - need to set terminal to non-canonical mode
+        import termios
+        import tty
+        
+        old_settings = termios.tcgetattr(sys.stdin)
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+            while True:
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    key = sys.stdin.read(1).lower()
+                    if key == 's':
+                        rprint("\n[bold yellow]Stop requested. Completing current trial before stopping...[/bold yellow]")
+                        set_terminate()  # Call the function to set termination flag
+                        break
+                time.sleep(0.1)
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 def run_interactive():
     """Run the benchmarking tool interactively"""
