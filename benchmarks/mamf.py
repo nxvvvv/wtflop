@@ -10,9 +10,9 @@ from optuna.storages import RDBStorage
 import warnings
 from pathlib import Path
 from rich import print as rprint
+from utils.shared_state import TERMINATE_REQUESTED, should_terminate
 
 from utils.arch import get_accelerator_arch
-from utils.utilities import should_terminate
 
 warnings.filterwarnings("ignore", message="set_metric_names is experimental*")
 
@@ -178,9 +178,11 @@ def run_benchmark(args):
     
     while n_trials_completed < max_trials:
         # Check if termination was requested before starting a new trial
-        if should_terminate():
-            rprint("[bold yellow]Benchmark stopped gracefully as requested[/bold yellow]")
-            break
+        if should_terminate():  # Using the shared function to check
+            print("\033[1;33mBenchmark stopped gracefully as requested\033[0m")
+            # Save any partial results if needed
+            best_tflops, best_config = finish(study, start_time)
+            return best_tflops, best_config  # Return results and exit
             
         # Run just one trial
         study.optimize(
@@ -190,7 +192,19 @@ def run_benchmark(args):
         )
         
         n_trials_completed += 1
-    
+
+        # Check if termination was requested after each trial
+        if TERMINATE_REQUESTED:
+            print("\033[1;33mStopping benchmark as requested\033[0m")
+            # Save any partial results if needed
+            best_tflops, best_config = finish(study, start_time)
+            return best_tflops, best_config
+        
+        # Check if we should terminate after each iteration  
+        if should_terminate():
+            print("\n\033[1;33mBenchmark stopped gracefully as requested\033[0m")
+            break
+
     # Finish benchmark and return results
     best_tflops, best_config = finish(study, start_time)
     return best_tflops, best_config

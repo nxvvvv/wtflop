@@ -10,9 +10,9 @@ import warnings
 from pathlib import Path
 import pandas as pd
 import gc
+from utils.shared_state import TERMINATE_REQUESTED, should_terminate, set_trial_status
 
 from utils.arch import get_accelerator_arch
-from utils.utilities import should_terminate
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -417,6 +417,8 @@ def benchmark_softmax(B, N, dtype, device, num_iterations, num_warmup_iterations
 
 def run_tensor_benchmark(args, op_type, dtype_str, B, N):
     """Run a specific tensor benchmark configuration"""
+    set_trial_status(True)  # Mark that a trial is starting
+    
     dtype = get_dtype(dtype_str)
     device = arch.device()
     
@@ -457,6 +459,9 @@ def run_tensor_benchmark(args, op_type, dtype_str, B, N):
         print(f"\nError with {op_type}, {dtype_str}, B={B}, N={N}: {e}")
         clean_up_memory()
         return None
+    
+    finally:
+        set_trial_status(False)  # Mark that the trial has completed
 
 def objective(trial, args):
     """Objective function for Optuna optimization"""
@@ -1034,6 +1039,11 @@ def run_benchmark(args):
                         config = f"{op_type}, {dtype_str}, B={B}, N={N}"
                         print(f"{progress} Testing {config}...", end="\r")
                         
+                        # Check if termination was requested before running this trial
+                        if should_terminate():
+                            print("\n\033[1;33mBenchmark stopped gracefully as requested\033[0m")
+                            return best_overall["tflops"], best_overall["config"]
+                        
                         # Run benchmark
                         try:
                             tflops = run_tensor_benchmark(args, op_type, dtype_str, B, N)
@@ -1067,19 +1077,10 @@ def run_benchmark(args):
                         except Exception as e:
                             print(f"\nError with {config}: {e}")
                         
-                        # Check if we should terminate after each iteration
-                        if should_terminate():
-                            print("\n[bold yellow]Benchmark stopped gracefully as requested[/bold yellow]")
-                            break  # Break from N loop
-                    
-                    if should_terminate():
-                        break  # Break from B loop
-                
-                if should_terminate():
-                    break  # Break from dtype_str loop
-            
-            if should_terminate():
-                break  # Break from op_type loop
+                        # Check if termination was requested after each trial
+                        if TERMINATE_REQUESTED:
+                            print("\n\033[1;33mStopping benchmark as requested\033[0m")
+                            return best_overall["tflops"], best_overall["config"]
         
         # Print best results
         print("\n\nBenchmark Complete!")

@@ -35,6 +35,7 @@ from utils.arch import get_accelerator_arch  # GPU architecture detection
 from utils.tee import Tee  # Output redirection to both console and file
 from utils.utilities import print_benchmark_header, handle_sigkill, set_terminate
 from utils.gpu_monitor import GPUMonitor  # GPU resource usage monitoring
+from utils.shared_state import TERMINATE_REQUESTED, set_terminate
 
 
 # Set up directory structure
@@ -73,9 +74,6 @@ custom_style = Style([
 
 # Initialize Rich console for pretty output
 console = Console()
-
-# Flag to signal graceful termination of benchmarks
-TERMINATE_REQUESTED = False
 
 def create_parser():
     """Create the argument parser with all options"""
@@ -414,7 +412,7 @@ def build_command(benchmark, benchmark_options, general_options):
 
 def keyboard_monitor():
     """Monitor keyboard input for stop command ('s' key) - works on both Windows and Linux"""
-    rprint("\n[bold yellow]Press 's' to stop the benchmark gracefully after current trial[/bold yellow]")
+    print("\n\033[1;33mPress 's' to stop the benchmark gracefully after current trial\033[0m")
     
     if IS_WINDOWS:
         # Windows-specific keyboard input handling
@@ -422,9 +420,13 @@ def keyboard_monitor():
             if msvcrt.kbhit():  # Check if a key was pressed
                 key = msvcrt.getch().decode('utf-8', errors='ignore').lower()
                 if key == 's':
-                    rprint("\n[bold yellow]Stop requested. Completing current trial before stopping...[/bold yellow]")
-                    set_terminate()  # Call the function to set termination flag
-                    break
+                    if TERMINATE_REQUESTED:
+                        print("\n\033[1;31mForcing benchmark termination...\033[0m")
+                        sys.stdout.flush()
+                        os._exit(0)  # Force immediate exit
+                    else:
+                        print("\n\033[1;33mStop requested. Completing current trial before stopping...\033[0m")
+                        set_terminate()  # Call the function to set termination flag
             time.sleep(0.1)  # Prevent CPU hogging
     else:
         # Linux/Mac - need to set terminal to non-canonical mode
@@ -438,12 +440,31 @@ def keyboard_monitor():
                 if select.select([sys.stdin], [], [], 0.1)[0]:
                     key = sys.stdin.read(1).lower()
                     if key == 's':
-                        rprint("\n[bold yellow]Stop requested. Completing current trial before stopping...[/bold yellow]")
-                        set_terminate()  # Call the function to set termination flag
-                        break
+                        if TERMINATE_REQUESTED:
+                            print("\n\033[1;31mForcing benchmark termination...\033[0m")
+                            sys.stdout.flush()
+                            os._exit(0)  # Force immediate exit
+                        else:
+                            print("\n\033[1;33mStop requested. Completing current trial before stopping...\033[0m")
+                            set_terminate()  # Call the function to set termination flag
                 time.sleep(0.1)
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+def check_termination():
+    """Check if termination is requested and handle it gracefully"""
+    last_trial_time = time.time()
+    trials_since_termination = 0
+    
+    while True:
+        if TERMINATE_REQUESTED:
+            current_time = time.time()
+            
+            # If we see a new trial completing, record it
+            if current_time - last_trial_time > 0.5:  # Assume a new trial if 0.5+ sec has passed
+                last_trial_time = current_time
+                trials_since_termination += 1
+        time.sleep(0.5)
 
 def run_interactive():
     """Run the benchmarking tool interactively"""
@@ -575,12 +596,24 @@ def main():
     
     signal.signal(signal.SIGINT, signal_handler)
     
+    # Initialize the termination check thread
+    termination_check = threading.Thread(target=check_termination, daemon=True)
+    termination_check.start()
+    
     # Run the selected benchmark
     if args.benchmark in AVAILABLE_BENCHMARKS:
         try:
             # Run benchmark WITHOUT passing termination_flag directly
             # Instead, use the global variable that the benchmark functions can check
             result = AVAILABLE_BENCHMARKS[args.benchmark](args)
+            
+            # If we got here and termination was requested, but benchmark completed anyway,
+            # we can just exit now
+            if TERMINATE_REQUESTED:
+                print("\n\033[1;33mBenchmark completed after termination request.\033[0m")
+                if monitor:
+                    monitor.stop_monitoring()
+                sys.exit(0)
             
             # Process benchmark results if they were returned
             if isinstance(result, tuple) and len(result) == 2:
