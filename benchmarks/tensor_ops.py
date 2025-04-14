@@ -11,8 +11,8 @@ from pathlib import Path
 import pandas as pd
 import gc
 from utils.shared_state import TERMINATE_REQUESTED, should_terminate, set_trial_status
-
 from utils.arch import get_accelerator_arch
+from utils.db_utils import save_benchmark_result, update_benchmark_summary
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -125,6 +125,20 @@ def add_benchmark_args(parser):
         "--min_tflops",
         type=float,
         help="Filter database analysis by minimum TFLOPS value"
+    )
+    # Add database-specific arguments if not already present
+    database_group = parser.add_argument_group('Database Options')
+    database_group.add_argument(
+        "--db-file",
+        type=str,
+        default=None,
+        help="Path to database file for saving benchmark results (default: None)"
+    )
+    database_group.add_argument(
+        "--summary-file",
+        type=str,
+        default=None,
+        help="Path to summary file for updating benchmark results (default: None)"
     )
 
 def get_dtype(dtype_str):
@@ -546,6 +560,20 @@ def save_results_to_db(db_path, benchmark_results, config_info):
     
     conn.commit()
     conn.close()
+    
+    # Also use the db_utils version for uniformity
+    perf_data = {
+        "avg_tflops": sum(result['tflops'] for result in benchmark_results) / len(benchmark_results) if benchmark_results else 0,
+        "max_tflops": max(result['tflops'] for result in benchmark_results) if benchmark_results else 0,
+        "total_configs_tested": len(benchmark_results)
+    }
+    
+    save_benchmark_result(
+        db_path, 
+        'tensor', 
+        perf_data, 
+        config_info
+    )
 
 def read_results_from_db(db_path, limit=None, operation=None, dtype=None, min_tflops=None):
     """
@@ -1094,7 +1122,7 @@ def run_benchmark(args):
                 if best['tflops'] > 0:
                     print(f"  {op.upper()}: {best['tflops']:.2f} TFLOPS - {best['config']}")
                 
-            # Save results to database
+            # Save results to database  
             config_info = {
                 "operations": args.operations,
                 "dtypes": args.dtypes,
@@ -1107,12 +1135,44 @@ def run_benchmark(args):
                 "memory_safety": args.memory_safety
             }
             
+            # Format the data for the unified db_utils and summary
+            perf_data = {
+                "tflops": best_overall["tflops"],
+                "avg_tflops": sum(r['tflops'] for r in all_results) / len(all_results) if all_results else 0,
+                "successful_configs": successful_configs,
+                "total_configs": total_configs,
+            }
+            
+            for op in best_per_op:
+                if best_per_op[op]["tflops"] > 0:
+                    perf_data[f"{op}_tflops"] = best_per_op[op]["tflops"]
+            
+            # Add best configuration to the config
+            config_info["best_config"] = best_overall["config"]
+            
             try:
+                # Use the unified save_benchmark_result
+                benchmark_id = save_benchmark_result(
+                    args.db_file, 
+                    'tensor', 
+                    perf_data, 
+                    config_info
+                )
+                print(f"\nResults saved to database (ID: {benchmark_id})")
+                
+                # Also save to custom format
                 save_results_to_db(args.db_file, all_results, config_info)
-                print(f"\nDetailed results saved to database: {args.db_file}")
+                
+                # Update benchmark summary file if available
+                if hasattr(args, 'summary_file') and args.summary_file:
+                    device_info = str(arch.device_info())
+                    if update_benchmark_summary(args.summary_file, 'tensor', perf_data, config_info, device_info):
+                        print(f"Benchmark result added to summary: {args.summary_file}")
+                        args.summary_updated = True
+            
             except Exception as e:
-                # Fallback to CSV if database save fails
                 print(f"\nError saving to database: {e}")
+                # Fallback to CSV if database save fails
                 # Save as CSV instead
                 results_df = pd.DataFrame(all_results)
                 csv_path = results_dir / f"tensor_ops_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"

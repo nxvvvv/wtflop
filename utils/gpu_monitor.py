@@ -43,7 +43,7 @@ class GPUMonitor:
         ''')
         
         # Check if we need to create benchmark-specific metrics tables
-        benchmark_types = ["mamf", "tensor"]
+        benchmark_types = ["mamf", "tensor", "datagen", "transfer", "membw", "inference", "compute"]
         
         for benchmark_type in benchmark_types:
             table_name = f"gpu_metrics_{benchmark_type}"
@@ -60,6 +60,62 @@ class GPUMonitor:
                 memory_used INTEGER,
                 memory_total INTEGER,
                 FOREIGN KEY (benchmark_id) REFERENCES benchmarks(id)
+            )
+            ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def init_db(self):
+        """Initialize the database for GPU monitoring."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        
+        # Create main table for GPU monitoring sessions
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS gpu_monitoring_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            session_name TEXT,
+            benchmark_type TEXT,
+            parameters TEXT
+        )
+        ''')
+        
+        # Create table for GPU metrics
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS gpu_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER,
+            timestamp REAL,
+            gpu_id INTEGER,
+            utilization_gpu REAL,
+            utilization_memory REAL,
+            memory_used REAL,
+            memory_total REAL,
+            temperature REAL,
+            power_draw REAL,
+            FOREIGN KEY (session_id) REFERENCES gpu_monitoring_sessions(id)
+        )
+        ''')
+        
+        # Check if we need to create benchmark-specific metrics tables
+        benchmark_types = ["mamf", "tensor", "datagen", "transfer", "membw", "inference", "compute"]
+        
+        for benchmark_type in benchmark_types:
+            c.execute(f'''
+            CREATE TABLE IF NOT EXISTS gpu_metrics_{benchmark_type} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
+                timestamp REAL,
+                gpu_id INTEGER,
+                utilization_gpu REAL,
+                utilization_memory REAL,
+                memory_used REAL,
+                memory_total REAL,
+                temperature REAL,
+                power_draw REAL,
+                FOREIGN KEY (session_id) REFERENCES gpu_monitoring_sessions(id)
             )
             ''')
         
@@ -112,6 +168,31 @@ class GPUMonitor:
         
         # Use benchmark type-specific table
         metrics_table = f"gpu_metrics_{self.benchmark_type}"
+        
+        # Verify the table exists
+        try:
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{metrics_table}'")
+            if not cursor.fetchone():
+                # Table doesn't exist - create it
+                print(f"Creating missing table: {metrics_table}")
+                cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {metrics_table} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    benchmark_id INTEGER NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    gpu_id INTEGER NOT NULL,
+                    utilization_gpu INTEGER,
+                    utilization_memory INTEGER,
+                    temperature_gpu INTEGER,
+                    power_draw REAL,
+                    memory_used INTEGER,
+                    memory_total INTEGER,
+                    FOREIGN KEY (benchmark_id) REFERENCES benchmarks(id)
+                )
+                ''')
+                conn.commit()
+        except Exception as e:
+            print(f"Error checking/creating table {metrics_table}: {e}")
         
         while not self.stop_event.is_set():
             try:
@@ -193,24 +274,42 @@ class GPUMonitor:
         return self.benchmark_id
     
     def stop_monitoring(self):
-        """Stop GPU monitoring and update benchmark end time"""
-        if not self.monitor_thread or not self.monitor_thread.is_alive():
+        """Stop the monitoring thread and update benchmark end time."""
+        if not hasattr(self, 'monitor_thread') or self.monitor_thread is None:
+            print("Warning: No active monitoring thread to stop")
             return
         
-        # Set stop event to end monitoring thread
+        # Signal the thread to stop
         self.stop_event.set()
-        self.monitor_thread.join(timeout=2.0)
         
-        # Update benchmark with end time
+        # Wait for thread to complete with timeout
+        try:
+            if self.monitor_thread.is_alive():
+                self.monitor_thread.join(timeout=3)
+                
+                # If thread is still running after timeout, it's likely stuck
+                if self.monitor_thread.is_alive():
+                    print("Warning: Monitoring thread did not exit within timeout")
+        except Exception as e:
+            print(f"Error stopping monitoring thread: {e}")
+        
+        # Update benchmark end time in the database
         if self.benchmark_id:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-            UPDATE benchmarks
-            SET end_time = ?
-            WHERE id = ?
-            ''', (datetime.now().isoformat(), self.benchmark_id))
-            
-            conn.commit()
-            conn.close()
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE benchmarks SET end_time = ? WHERE id = ?",
+                    (datetime.now().isoformat(), self.benchmark_id)
+                )
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"Error updating benchmark end time: {e}")
+        
+        # Reset internal state
+        self.monitor_thread = None
+        self.benchmark_id = None
+        self.benchmark_type = None
+        
+        print("GPU monitoring stopped")

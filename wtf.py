@@ -8,7 +8,6 @@ import shlex
 import signal
 import sys
 import time
-import torch
 import json
 from typing import List, Dict, Any, Optional
 import typer
@@ -21,6 +20,15 @@ from questionary import Style
 import subprocess
 import threading
 import select
+
+# Fix CUDA multiprocessing issue
+if platform.system() != 'Windows':  # Not needed on Windows
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Method already set
+        pass
 
 # Detect operating system for platform-specific code
 IS_WINDOWS = platform.system() == 'Windows'
@@ -36,7 +44,7 @@ from utils.tee import Tee  # Output redirection to both console and file
 from utils.utilities import print_benchmark_header, handle_sigkill, set_terminate
 from utils.gpu_monitor import GPUMonitor  # GPU resource usage monitoring
 from utils.shared_state import TERMINATE_REQUESTED, set_terminate
-
+from utils.db_utils import setup_database, update_benchmark_summary  # Database utilities
 
 # Set up directory structure
 ROOT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -49,16 +57,22 @@ RESULTS_DIR.mkdir(exist_ok=True)
 (RESULTS_DIR / "reports").mkdir(exist_ok=True)  # For generated reports
 
 
-# Import available benchmarks
-try:
-    from benchmarks import mamf, tensor_ops
-    AVAILABLE_BENCHMARKS = {
-        "mamf": mamf.run_benchmark,        # Matrix multiplication benchmark
-        "tensor": tensor_ops.run_benchmark, # Tensor operations benchmark
-    }
-except ImportError as e:
-    print(f"Warning: Could not import a benchmark module: {e}")
-    AVAILABLE_BENCHMARKS = {}
+# Import available benchmarks dynamically when needed
+AVAILABLE_BENCHMARKS = {
+    "mamf": "benchmarks.mamf",
+    "tensor": "benchmarks.tensor_ops",
+    "datagen": "benchmarks.data_generation",
+    "transfer": "benchmarks.transfer",
+    "membw": "benchmarks.memory_bandwidth",
+    "inference": "benchmarks.inference",
+    "compute": "benchmarks.computation"
+}
+
+def get_benchmark_function(name):
+    """Dynamically import and return the benchmark function and module"""
+    module_name = AVAILABLE_BENCHMARKS[name]
+    module = __import__(module_name, fromlist=['run_benchmark', 'add_benchmark_args'])
+    return module, module.run_benchmark
 
 
 # Define custom styling for the interactive CLI
@@ -88,7 +102,8 @@ def create_parser():
     )
     # Output file configuration
     parser.add_argument(
-        "--output_file", 
+        "--output-file",  # Changed to hyphen
+        "--output_file",  # Keep underscore version for backward compatibility
         type=str, 
         default=None,
         help="File to save benchmark results (defaults to results/logs/<benchmark>_<timestamp>.txt)"
@@ -109,49 +124,73 @@ def create_parser():
     )
     # GPU monitoring configuration
     parser.add_argument(
-        "--monitor_interval",
+        "--monitor-interval",  # Changed to hyphen
+        "--monitor_interval",  # Keep underscore version for backward compatibility
         type=float,
         default=1.0,
         help="Interval in seconds between GPU monitoring samples"
     )
     parser.add_argument(
-        "--monitor_db",
+        "--monitor-db",  # Changed to hyphen
+        "--monitor_db",  # Keep underscore version for backward compatibility
         type=str,
         default="gpu_monitoring.db",
         help="Database file to store GPU monitoring data"
     )
     parser.add_argument(
-        "--skip_monitoring",
+        "--skip-monitoring",  # Changed to hyphen
+        "--skip_monitoring",  # Keep underscore version for backward compatibility
         action="store_true",
         help="Skip GPU monitoring during benchmarks"
+    )
+    # Fast menu option
+    parser.add_argument(
+        "--fast-menu",
+        action="store_true",
+        help="Skip GPU initialization for faster menu loading"
     )
     
     return parser
 
 def get_benchmark_specific_options(benchmark_name):
-    """Get benchmark-specific options"""
-    # Create a temporary parser for benchmark-specific options
-    parser = argparse.ArgumentParser()
+    """Get command-line options specific to the selected benchmark"""
+    parser = argparse.ArgumentParser(add_help=False)
     
-    # Add benchmark-specific arguments
+    # Import the module, not just the function
     if benchmark_name == "mamf":
-        mamf.add_benchmark_args(parser)
+        import benchmarks.mamf as benchmark_module
     elif benchmark_name == "tensor":
-        tensor_ops.add_benchmark_args(parser)
-        
-    # Extract option details for interactive UI
-    options = {}
+        import benchmarks.tensor_ops as benchmark_module
+    elif benchmark_name == "datagen":
+        import benchmarks.data_generation as benchmark_module
+    elif benchmark_name == "transfer":
+        import benchmarks.transfer as benchmark_module
+    elif benchmark_name == "membw":
+        import benchmarks.memory_bandwidth as benchmark_module
+    elif benchmark_name == "inference":
+        import benchmarks.inference as benchmark_module
+    elif benchmark_name == "compute":
+        import benchmarks.computation as benchmark_module
+    else:
+        return {}
+    
+    # Use the module's add_benchmark_args function
+    if hasattr(benchmark_module, 'add_benchmark_args'):
+        benchmark_module.add_benchmark_args(parser)
+    
+    # Get information about arguments
+    option_info = {}
     for action in parser._actions:
-        if action.dest != 'help':
-            options[action.dest] = {
-                'help': action.help,
+        if action.dest != 'help':  # Skip help action
+            option_info[action.dest] = {
                 'default': action.default,
-                'type': action.type.__name__ if hasattr(action, 'type') and action.type else 'bool',
+                'help': action.help or f"Option {action.dest}",
+                'type': action.type.__name__ if action.type else 'str',
                 'choices': action.choices,
                 'nargs': action.nargs
             }
     
-    return options
+    return option_info
 
 def display_welcome():
     """Display welcome message and GPU information"""
@@ -172,34 +211,45 @@ def display_welcome():
     ))
 
 def select_benchmark():
-    """Let user select a benchmark to run"""
-    if not AVAILABLE_BENCHMARKS:
-        console.print("[bold red]No benchmarks available![/bold red]")
-        return None
+    """Allow user to select a benchmark to run"""
+    choices = [
+        {
+            "name": "Matrix Multiplication Benchmark (MAMF)",
+            "value": "mamf"
+        },
+        {
+            "name": "Tensor Operations Benchmark",
+            "value": "tensor"
+        },
+        {
+            "name": "GPU Data Generation Benchmark",
+            "value": "datagen"
+        },
+        {
+            "name": "GPU Transfer Benchmarks (GPU-to-CPU, GPU-to-GPU)",
+            "value": "transfer"
+        },
+        {
+            "name": "Memory Bandwidth Benchmarks (GPU & System)",
+            "value": "membw"
+        },
+        {
+            "name": "GPU Inference Benchmark",
+            "value": "inference"
+        },
+        {
+            "name": "GPU Computational Benchmark",
+            "value": "compute"
+        }
+    ]
     
-    # Display available benchmarks in a table
-    table = Table(title="Available Benchmarks")
-    table.add_column("Benchmark", style="cyan")
-    table.add_column("Description", style="green")
-    
-    descriptions = {
-        "mamf": "Matrix Multiplication Benchmark (tests raw computational throughput)",
-        "tensor": "Tensor Operations Benchmark (tests various tensor operations)"
-    }
-    
-    for benchmark in AVAILABLE_BENCHMARKS.keys():
-        table.add_row(benchmark, descriptions.get(benchmark, ""))
-    
-    console.print(table)
-    
-    # Let user select a benchmark
-    selected = questionary.select(
+    benchmark = questionary.select(
         "Select a benchmark to run:",
-        choices=list(AVAILABLE_BENCHMARKS.keys()),
+        choices=choices,
         style=custom_style
     ).ask()
     
-    return selected
+    return benchmark
 
 def configure_benchmark(benchmark_name):
     """Configure benchmark options interactively"""
@@ -212,7 +262,24 @@ def configure_benchmark(benchmark_name):
     table.add_column("Default", style="yellow")
     table.add_column("Description", style="green")
     
-    for name, details in options.items():
+    # Add this conversion to convert simple values to option dictionaries
+    formatted_options = {}
+    for name, value in options.items():
+        # Check if this is already a dictionary with the expected structure
+        if isinstance(value, dict) and 'default' in value and 'help' in value:
+            formatted_options[name] = value
+        else:
+            # This is a simple value from argparse, create the expected structure
+            formatted_options[name] = {
+                'default': value,
+                'help': f"Option {name}",  # Basic description
+                'type': type(value).__name__,
+                'choices': None,
+                'nargs': None
+            }
+    
+    # Use the formatted options for display
+    for name, details in formatted_options.items():
         default_str = str(details['default'])
         if isinstance(details['default'], list):
             default_str = str(details['default']).replace(',', ', ')
@@ -220,6 +287,7 @@ def configure_benchmark(benchmark_name):
     
     console.print(table)
     
+    # Rest of the function using formatted_options instead of options
     # Ask if user wants to customize options
     customize = questionary.confirm(
         "Would you like to customize benchmark options?",
@@ -233,7 +301,7 @@ def configure_benchmark(benchmark_name):
     # Let user select which options to customize
     to_customize = questionary.checkbox(
         "Select options to customize:",
-        choices=list(options.keys()),
+        choices=list(formatted_options.keys()),
         style=custom_style
     ).ask()
     
@@ -241,7 +309,7 @@ def configure_benchmark(benchmark_name):
     custom_options = {}
     
     for option in to_customize:
-        details = options[option]
+        details = formatted_options[option]
         
         # Boolean options use confirm dialog
         if details['type'] == 'bool':
@@ -383,32 +451,37 @@ def build_command(benchmark, benchmark_options, general_options):
     
     # Add benchmark-specific options
     for option, value in benchmark_options.items():
+        # Convert underscores to hyphens for command-line arguments
+        cli_option = option.replace('_', '-')
+        
         if isinstance(value, bool):
             if value:
-                cmd.append(f"--{option}")
+                cmd.append(f"--{cli_option}")
             else:
-                cmd.append(f"--no-{option}")
+                cmd.append(f"--no-{cli_option}")
         elif isinstance(value, list):
-            cmd.append(f"--{option}")
+            cmd.append(f"--{cli_option}")
             for item in value:
                 cmd.append(str(item))
         else:
-            cmd.append(f"--{option}")
+            cmd.append(f"--{cli_option}")
             cmd.append(str(value))
     
     # Add general options
     for option, value in general_options.items():
+        # DO NOT convert underscores to hyphens for general options
+        cli_option = option  # Use the option name directly
+        
         if isinstance(value, bool):
             if value:
-                cmd.append(f"--{option}")
+                cmd.append(f"--{cli_option}")
             else:
-                cmd.append(f"--no-{option}")
+                cmd.append(f"--no-{cli_option}")
         else:
-            cmd.append(f"--{option}")
+            cmd.append(f"--{cli_option}")
             cmd.append(str(value))
     
     return cmd
-
 
 def keyboard_monitor():
     """Monitor keyboard input for stop command ('s' key) - works on both Windows and Linux"""
@@ -468,7 +541,11 @@ def check_termination():
 
 def run_interactive():
     """Run the benchmarking tool interactively"""
-    display_welcome()
+    # Skip GPU info display if fast-menu was used
+    if not sys.argv[1:] or '--fast-menu' not in sys.argv[1:]:
+        display_welcome()
+    else:
+        print("GPU Benchmark Tool - Fast Menu Mode")
     
     # Step 1: Select benchmark
     benchmark = select_benchmark()
@@ -503,6 +580,9 @@ def run_interactive():
 def main():
     global TERMINATE_REQUESTED
     
+    # Import torch only when ready to run the benchmark
+    import torch
+    
     # Check if no arguments were provided (interactive mode)
     if len(sys.argv) == 1:
         # No arguments, run interactive mode
@@ -515,11 +595,27 @@ def main():
     # First pass to get the benchmark name
     temp_args, _ = parser.parse_known_args()
     
-    # Add benchmark-specific arguments based on selected benchmark
+    # Import the module directly
     if temp_args.benchmark == "mamf":
-        mamf.add_benchmark_args(parser)
+        import benchmarks.mamf as benchmark_module
     elif temp_args.benchmark == "tensor":
-        tensor_ops.add_benchmark_args(parser)
+        import benchmarks.tensor_ops as benchmark_module
+    elif temp_args.benchmark == "datagen":
+        import benchmarks.data_generation as benchmark_module
+    elif temp_args.benchmark == "transfer":
+        import benchmarks.transfer as benchmark_module
+    elif temp_args.benchmark == "membw":
+        import benchmarks.memory_bandwidth as benchmark_module
+    elif temp_args.benchmark == "inference":
+        import benchmarks.inference as benchmark_module
+    elif temp_args.benchmark == "compute":
+        import benchmarks.computation as benchmark_module
+    else:
+        print(f"Error: Benchmark '{temp_args.benchmark}' not available.")
+        return
+    
+    # Add benchmark-specific arguments
+    benchmark_module.add_benchmark_args(parser)
     
     # Final argument parsing with all options
     args = parser.parse_args()
@@ -545,18 +641,23 @@ def main():
     print_benchmark_header(dtype, device, args.notes, arch)
     print(f"Results will be saved to: {args.output_file}")
     
-    # Set up benchmark database path
-    if args.benchmark == "mamf":
-        db_file = getattr(args, 'db_file', 'mamf.db')
-        db_path = RESULTS_DIR / "db" / db_file
-        print(f"Benchmark database file: {db_path}")
-    elif args.benchmark == "tensor":
-        db_file = getattr(args, 'db_file', 'tensor_ops.db')
-        db_path = RESULTS_DIR / "db" / db_file
-        print(f"Benchmark database file: {db_path}")
+    # Set up benchmark database path for all benchmarks
+    benchmark_type = args.benchmark
+    db_file = getattr(args, 'db_file', None)
+    if db_file is None:
+        db_file = f"{args.benchmark}.db"
+    db_path = RESULTS_DIR / "db" / db_file
+    print(f"Benchmark database file: {db_path}")
+    
+    # Initialize database for the benchmark type
+    setup_database(db_path)
     
     # Update args with absolute database path
     args.db_file = str(db_path)
+    
+    # Set summary path for all benchmarks
+    summary_path = RESULTS_DIR / "benchmark_summary.json"
+    args.summary_file = str(summary_path)
     
     # Start GPU monitoring if enabled
     monitor = None
@@ -588,11 +689,21 @@ def main():
     # Set up signal handler for ctrl+c
     def signal_handler(signum, frame):
         global TERMINATE_REQUESTED
-        TERMINATE_REQUESTED = True
-        if monitor:
-            print("Stopping GPU monitoring...")
-            monitor.stop_monitoring()
-        handle_sigkill(start_time)
+        
+        if TERMINATE_REQUESTED:
+            print("\n\033[1;31mForcing immediate termination...\033[0m")
+            # Force cleanup
+            if monitor:
+                try:
+                    monitor.stop_monitoring()
+                except:
+                    pass
+            sys.exit(1)
+        else:
+            TERMINATE_REQUESTED = True
+            print("\n\033[1;33mStop requested. Completing current trial before stopping...\033[0m")
+            print("\nTermination flag set - will stop after current trial")
+            print("Press 's' again to force immediate termination")
     
     signal.signal(signal.SIGINT, signal_handler)
     
@@ -603,63 +714,60 @@ def main():
     # Run the selected benchmark
     if args.benchmark in AVAILABLE_BENCHMARKS:
         try:
-            # Run benchmark WITHOUT passing termination_flag directly
-            # Instead, use the global variable that the benchmark functions can check
-            result = AVAILABLE_BENCHMARKS[args.benchmark](args)
-            
-            # If we got here and termination was requested, but benchmark completed anyway,
-            # we can just exit now
-            if TERMINATE_REQUESTED:
-                print("\n\033[1;33mBenchmark completed after termination request.\033[0m")
-                if monitor:
-                    monitor.stop_monitoring()
-                sys.exit(0)
+            # Run benchmark
+            result = benchmark_module.run_benchmark(args)
             
             # Process benchmark results if they were returned
             if isinstance(result, tuple) and len(result) == 2:
                 summary_path = RESULTS_DIR / "benchmark_summary.json"
                 
-                # Load existing summary if available
-                summary = {}
-                if os.path.exists(summary_path):
-                    try:
-                        with open(summary_path, 'r') as f:
-                            summary = json.load(f)
-                    except json.JSONDecodeError:
-                        summary = {}
-                
-                # Add new benchmark result to summary
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if args.benchmark not in summary:
-                    summary[args.benchmark] = []
-                
-                summary[args.benchmark].append({
-                    "timestamp": timestamp,
-                    "performance": result[0],
-                    "config": result[1],
-                    "device": str(arch.device_info())
-                })
-                
-                # Save updated summary
-                with open(summary_path, 'w') as f:
-                    json.dump(summary, f, indent=2)
-                
-                print(f"Benchmark result added to summary: {summary_path}")
-                
+                # Skip summary update if already done in benchmark module
+                if not hasattr(args, 'summary_updated') or not args.summary_updated:
+                    # Load existing summary if available
+                    summary = {}
+                    if os.path.exists(summary_path):
+                        try:
+                            with open(summary_path, 'r') as f:
+                                summary = json.load(f)
+                        except json.JSONDecodeError:
+                            summary = {}
+                    
+                    # Extract benchmark results
+                    perf_data, config = result
+                    
+                    # Create result data for summary
+                    device_info = arch.device_info()
+                    
+                    result_data = {
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "performance": perf_data.get('throughput_samples_per_sec', 0) or
+                                       perf_data.get('bandwidth_gbps', 0) or
+                                       perf_data.get('gflops', 0),
+                        "config": str(config),
+                        "device": str(device_info)
+                    }
+                    
+                    # Update summary with the new result
+                    from utils.db_utils import update_benchmark_summary
+                    update_benchmark_summary(args.benchmark, result_data, summary_path)
+                    
         except Exception as e:
             print(f"Error running benchmark: {e}")
+        finally:
+            # Always ensure monitoring is stopped properly
+            if monitor:
+                try:
+                    print("Stopping GPU monitoring...")
+                    monitor.stop_monitoring()
+                except Exception as e:
+                    print(f"Error stopping GPU monitoring: {e}")
+            
+            # Calculate and print total benchmark time
+            time_delta = time.time() - start_time
+            time_str = str(datetime.timedelta(seconds=time_delta)).split(".")[0]
+            print(f"Total benchmark time: {time_str}")
     else:
         print(f"Error: Benchmark '{args.benchmark}' not available.")
-    
-    # Stop GPU monitoring if it was started
-    if monitor:
-        monitor.stop_monitoring()
-        print("GPU monitoring stopped")
-    
-    # Calculate and print total benchmark time
-    time_delta = time.time() - start_time
-    time_str = str(datetime.timedelta(seconds=time_delta)).split(".")[0]
-    print(f"Total benchmark time: {time_str}")
 
 if __name__ == "__main__":
     main()

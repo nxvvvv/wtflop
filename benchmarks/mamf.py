@@ -11,6 +11,7 @@ import warnings
 from pathlib import Path
 from rich import print as rprint
 from utils.shared_state import TERMINATE_REQUESTED, should_terminate
+from utils.db_utils import save_benchmark_result, update_benchmark_summary
 
 from utils.arch import get_accelerator_arch
 
@@ -78,6 +79,12 @@ def add_benchmark_args(parser):
         default="mamf.db",
         help="Database file to store Optuna results",
     )
+    parser.add_argument(
+        "--summary_file",
+        type=str,
+        default=None,
+        help="Path to summary file for updating benchmark results (default: None)"
+    )
 
 def benchmark_mm(m, n, k, dtype, device, num_iterations, num_warmup_iterations):
     """Benchmark a single matrix multiplication operation"""
@@ -132,7 +139,22 @@ def finish(study, start_time):
         f"The best outcome was {best_tflops:.1f}TFLOPS @ {best_config} (tried {len(study.trials)} shapes)"
     )
     print(f"Elapsed time: {time_str}")
-    return best_tflops, best_config
+    
+    # Format the data for database and summary
+    perf_data = {
+        "tflops": best_tflops,
+        "total_time_seconds": time_delta,
+    }
+    
+    config = {
+        "best_shape": best_config,
+        "m": best_trial.params['M'],
+        "n": best_trial.params['N'],
+        "k": best_trial.params['K'],
+        "trials_count": len(study.trials)
+    }
+    
+    return perf_data, config
 
 def run_benchmark(args):
     """Main entry point for running the MAMF benchmark"""
@@ -178,11 +200,33 @@ def run_benchmark(args):
     
     while n_trials_completed < max_trials:
         # Check if termination was requested before starting a new trial
-        if should_terminate():  # Using the shared function to check
+        if should_terminate():
             print("\033[1;33mBenchmark stopped gracefully as requested\033[0m")
             # Save any partial results if needed
-            best_tflops, best_config = finish(study, start_time)
-            return best_tflops, best_config  # Return results and exit
+            perf_data, config = finish(study, start_time)
+            
+            # Save results to database if requested
+            if hasattr(args, 'db_file') and args.db_file:
+                try:
+                    benchmark_id = save_benchmark_result(
+                        args.db_file, 
+                        'mamf', 
+                        perf_data, 
+                        config
+                    )
+                    print(f"Benchmark results saved to database (ID: {benchmark_id})")
+                except Exception as e:
+                    print(f"Error saving to database: {e}")
+            
+            # Update benchmark summary file if available
+            if hasattr(args, 'summary_file') and args.summary_file:
+                device_info = str(arch.device_info())
+                if update_benchmark_summary(args.summary_file, 'mamf', perf_data, config, device_info):
+                    print(f"Benchmark result added to summary: {args.summary_file}")
+                update_benchmark_summary('mamf', perf_data, args.summary_file)
+                args.summary_updated = True
+                    
+            return perf_data, config
             
         # Run just one trial
         study.optimize(
@@ -196,15 +240,54 @@ def run_benchmark(args):
         # Check if termination was requested after each trial
         if TERMINATE_REQUESTED:
             print("\033[1;33mStopping benchmark as requested\033[0m")
-            # Save any partial results if needed
-            best_tflops, best_config = finish(study, start_time)
-            return best_tflops, best_config
-        
-        # Check if we should terminate after each iteration  
-        if should_terminate():
-            print("\n\033[1;33mBenchmark stopped gracefully as requested\033[0m")
-            break
+            # Save any partial results
+            perf_data, config = finish(study, start_time)
+            
+            # Save results to database if requested
+            if hasattr(args, 'db_file') and args.db_file:
+                try:
+                    benchmark_id = save_benchmark_result(
+                        args.db_file, 
+                        'mamf', 
+                        perf_data, 
+                        config
+                    )
+                    print(f"Benchmark results saved to database (ID: {benchmark_id})")
+                except Exception as e:
+                    print(f"Error saving to database: {e}")
+            
+            # Update benchmark summary file if available
+            if hasattr(args, 'summary_file') and args.summary_file:
+                device_info = str(arch.device_info())
+                if update_benchmark_summary(args.summary_file, 'mamf', perf_data, config, device_info):
+                    print(f"Benchmark result added to summary: {args.summary_file}")
+                update_benchmark_summary('mamf', perf_data, args.summary_file)
+                args.summary_updated = True
+                    
+            return perf_data, config
 
     # Finish benchmark and return results
-    best_tflops, best_config = finish(study, start_time)
-    return best_tflops, best_config
+    perf_data, config = finish(study, start_time)
+    
+    # Save results to database if requested
+    if hasattr(args, 'db_file') and args.db_file:
+        try:
+            benchmark_id = save_benchmark_result(
+                args.db_file, 
+                'mamf', 
+                perf_data, 
+                config
+            )
+            print(f"Benchmark results saved to database (ID: {benchmark_id})")
+        except Exception as e:
+            print(f"Error saving to database: {e}")
+    
+    # Update benchmark summary file if available
+    if hasattr(args, 'summary_file') and args.summary_file:
+        device_info = str(arch.device_info())
+        if update_benchmark_summary(args.summary_file, 'mamf', perf_data, config, device_info):
+            print(f"Benchmark result added to summary: {args.summary_file}")
+        update_benchmark_summary('mamf', perf_data, args.summary_file)
+        args.summary_updated = True
+    
+    return perf_data, config

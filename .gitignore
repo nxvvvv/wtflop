@@ -1,5 +1,4 @@
 # Data and results
-*.txt
 results/*.txt
 *.csv
 benchmark_summary.json
